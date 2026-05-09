@@ -246,8 +246,12 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
                 if (params.num_splits <= 1 && !force_split_kernel) {  // If we don't set it num_splits == 0
                     run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
-                } else {
+                } else if constexpr (Is_causal) {
                     run_mha_fwd_splitkv_dispatch<elem_type, kHeadDim, Is_causal>(params, stream);
+                } else {
+                    // Fall back to non-split path for non-causal: split-kv non-causal has
+                    // known nvcc compilation hangs (hdim 32/64/96/128).
+                    run_mha_fwd_<elem_type, kHeadDim, Is_causal>(params, stream);
                 }
             });
         });
@@ -360,6 +364,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         int window_size_right,
         const float softcap,
         const bool return_softmax,
+        const bool return_entropy,
         std::optional<at::Generator> gen_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -449,6 +454,12 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         p = torch::empty({ 0 }, opts);
     }
 
+    at::Tensor entropy;
+    if (return_entropy) {
+        TORCH_CHECK(p_dropout == 0.0f, "return_entropy is only supported when p_dropout == 0.0");
+        entropy = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
+    }
+
     Flash_fwd_params params;
     set_params_fprop(params,
                      batch_size,
@@ -468,6 +479,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
                      window_size_right,
                      softcap
                      );
+
+    params.entropy_ptr = return_entropy ? entropy.data_ptr() : nullptr;
 
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
@@ -508,7 +521,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         q = q.transpose(1, 2).reshape({batch_size, 1, num_heads_k * seqlen_q, head_size});
         softmax_lse = softmax_lse.reshape({batch_size, num_heads_k * seqlen_q, 1});
     }
-    return {out, softmax_lse, p, rng_state};
+    if (!return_entropy) { entropy = torch::empty({0}, opts); }
+    return {out, softmax_lse, p, rng_state, entropy};
 }
 
 std::vector<at::Tensor>
@@ -751,7 +765,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
         softmax_lse = softmax_lse.reshape({num_heads * max_seqlen_q, batch_size});
     }
 
-    return {out, softmax_lse, p, rng_state};
+    return {out, softmax_lse, p, rng_state, torch::empty({0}, opts)};
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {

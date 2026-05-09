@@ -94,9 +94,9 @@ def _flash_attn_forward(
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
+    out, softmax_lse, S_dmask, rng_state, _ = flash_attn_gpu.fwd(
         q,
         k,
         v,
@@ -109,6 +109,7 @@ def _flash_attn_forward(
         window_size_right,
         softcap,
         return_softmax,
+        False,  # return_entropy
         None,
     )
     return out, softmax_lse, S_dmask, rng_state
@@ -127,7 +128,7 @@ def _flash_attn_forward_fake(
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
     return_softmax: bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
     seqlen_k = k.shape[1]
@@ -172,9 +173,9 @@ def _flash_attn_varlen_forward(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
     num_splits: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
-    out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
+    out, softmax_lse, S_dmask, rng_state, _ = flash_attn_gpu.varlen_fwd(
         q,
         k,
         v,
@@ -225,12 +226,12 @@ def _flash_attn_varlen_forward_fake(
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
     num_splits: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
-    
+
     out = torch.empty_like(q)
     softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout)
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
@@ -482,7 +483,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state =  _wrapped_flash_attn_forward(
+        out_padded, softmax_lse, S_dmask, rng_state, _ =  _wrapped_flash_attn_forward(
             q,
             k,
             v,
@@ -566,7 +567,7 @@ class FlashAttnVarlenQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+        out_padded, softmax_lse, S_dmask, rng_state, _ = _wrapped_flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -752,7 +753,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+        out_padded, softmax_lse, S_dmask, rng_state, _ = _wrapped_flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -943,7 +944,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_varlen_forward(
+        out_padded, softmax_lse, S_dmask, rng_state, _ = _wrapped_flash_attn_varlen_forward(
             q,
             k,
             v,
@@ -1228,6 +1229,62 @@ def flash_attn_func(
         return_attn_probs,
         torch.is_grad_enabled(),
     )
+
+
+def flash_attn_func_with_entropy(
+    q,
+    k,
+    v,
+    dropout_p=0.0,
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    alibi_slopes=None,
+):
+    """FlashAttention forward pass that also returns per-token base-2 entropy.
+
+    This is a no-grad path: entropy is always computed with torch.no_grad().
+    Currently only supports dropout_p=0.0, fixed-length sequences, fp16/bf16.
+
+    Args:
+        q: (batch_size, seqlen, nheads, headdim)
+        k: (batch_size, seqlen, nheads_k, headdim)
+        v: (batch_size, seqlen, nheads_k, headdim)
+        dropout_p: float. Must be 0.0 when computing entropy.
+        softmax_scale: float. Default to 1 / sqrt(headdim).
+        causal: bool. Whether to apply causal mask.
+        window_size: (left, right). Sliding window local attention.
+        softcap: float. Softcapping value (0.0 = deactivated).
+        alibi_slopes: (nheads,) or (batch_size, nheads), fp32.
+
+    Returns:
+        out: (batch_size, seqlen, nheads, headdim). Attention output.
+        entropy: (batch_size, nheads, seqlen), fp32. Base-2 entropy of the
+            attention distribution for each query token.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+    window_size_left, window_size_right = window_size
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    with torch.no_grad():
+        out, softmax_lse, S_dmask, rng_state, entropy_tensor = flash_attn_gpu.fwd(
+            q,
+            k,
+            v,
+            None,  # out_
+            alibi_slopes,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size_left,
+            window_size_right,
+            softcap,
+            False,  # return_softmax
+            True,   # return_entropy
+            None,   # gen_
+        )
+    return out, entropy_tensor
 
 
 def flash_attn_varlen_qkvpacked_func(

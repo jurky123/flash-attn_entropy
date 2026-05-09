@@ -47,8 +47,19 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
         return local_tile(mLSE_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
 }
 
+template<typename ElementAccum, typename Params, int kBlockM, bool Is_even_MN>
+__forceinline__ __device__ auto get_entropy_tile(const Params &params, const int bidb, const int bidh, const int m_block, const BlockInfo</*Varlen=*/!Is_even_MN> &binfo) {
+        auto gmem_ptr_entropy = make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.entropy_ptr));
+        auto entropy_shape = make_shape(params.b, params.h, params.seqlen_q);
+        auto entropy_stride = make_stride(params.h * params.seqlen_q, params.seqlen_q, 1);
+        auto entropy_layout = make_layout(entropy_shape, entropy_stride);
+        Tensor mEntropy = make_tensor(gmem_ptr_entropy, entropy_layout);
+        Tensor mEntropy_slice = mEntropy(bidb, bidh, _);
+        return local_tile(mEntropy_slice, Shape<Int<kBlockM>>{}, make_coord(m_block));
+}
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool Return_entropy, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -123,6 +134,14 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         for (int m = 0; m < size<1>(tOgO); ++m) {
             const int row = get<0>(tOcO(0, m, 0));
             if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
+        }
+        if constexpr (Return_entropy) {
+            Tensor gEntropy = get_entropy_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+            #pragma unroll
+            for (int m = 0; m < size<1>(tOgO); ++m) {
+                const int row = get<0>(tOcO(0, m, 0));
+                if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gEntropy(row) = 0.f; }
+            }
         }
         return;
     }
@@ -282,7 +301,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
-    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o), Return_entropy> softmax;
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
@@ -432,6 +451,20 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
 
+    typename Softmax<2 * size<1>(acc_o), Return_entropy>::TensorT entropy;
+    if constexpr (Return_entropy) {
+        #pragma unroll
+        for (int mi = 0; mi < size(lse); ++mi) {
+            float sum = softmax.row_sum(mi);
+            if (sum == 0.f || sum != sum) {
+                entropy(mi) = 0.f;
+            } else {
+                // entropy = log(l) - scale * e / l  (in nats)
+                entropy(mi) = __logf(sum) - params.scale_softmax * softmax.row_acc(mi) / sum;
+            }
+        }
+    }
+
     // Convert acc_o from fp32 to fp16/bf16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
     Tensor sO = make_tensor(sQ.data(), typename Kernel_traits::SmemLayoutO{});    // (SMEM_M,SMEM_N)
@@ -475,6 +508,17 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         for (int mi = 0; mi < size(lse); ++mi) {
             const int row = get<0>(taccOcO_row(mi));
             if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
+        }
+    }
+
+    if constexpr (Return_entropy) {
+        Tensor gEntropy = get_entropy_tile<ElementAccum, Params, kBlockM, Is_even_MN>(params, bidb, bidh, m_block, binfo);
+        if (get<1>(taccOcO_row(0)) == 0) {
+            #pragma unroll
+            for (int mi = 0; mi < size(entropy); ++mi) {
+                const int row = get<0>(taccOcO_row(mi));
+                if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gEntropy(row) = entropy(mi); }
+            }
         }
     }
 
@@ -1072,7 +1116,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, bool Return_entropy, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1088,7 +1132,7 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax, Return_entropy>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

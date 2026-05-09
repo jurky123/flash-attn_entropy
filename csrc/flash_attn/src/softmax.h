@@ -125,11 +125,11 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template <int kNRows>
+template <int kNRows, bool Return_entropy=false>
 struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
-    TensorT row_max, row_sum;
+    TensorT row_max, row_sum, row_acc;
 
     __forceinline__ __device__ Softmax() {};
 
@@ -138,10 +138,28 @@ struct Softmax {
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
+        Tensor scores_raw = make_fragment_like(scores);
+        if constexpr (Return_entropy) {
+            cute::copy(scores, scores_raw);
+        }
         if (Is_first) {
             FLASH_NAMESPACE::template reduce_max</*zero_init=*/true>(scores, row_max);
             FLASH_NAMESPACE::scale_apply_exp2(scores, row_max, softmax_scale_log2);
             FLASH_NAMESPACE::reduce_sum</*zero_init=*/true>(scores, row_sum);
+            if constexpr (Return_entropy) {
+                #pragma unroll
+                for (int mi = 0; mi < size(row_acc); ++mi) {
+                    float acc = 0.f;
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ++ni) {
+                        float raw = scores_raw(mi, ni);
+                        if (raw == -INFINITY || raw == INFINITY) { continue; }
+                        // e = sum((s_i - row_max) * exp(s_i - row_max))
+                        acc += (raw - row_max(mi)) * scores(mi, ni);
+                    }
+                    row_acc(mi) = acc;
+                }
+            }
         } else {
             Tensor scores_max_prev = make_fragment_like(row_max);
             cute::copy(row_max, scores_max_prev);
@@ -155,6 +173,13 @@ struct Softmax {
                     ? row_max(mi)
                     : (row_max(mi) == -INFINITY ? 0.0f : row_max(mi));
                 float scores_scale = exp2f((scores_max_prev(mi) - scores_max_cur) * softmax_scale_log2);
+                if constexpr (Return_entropy) {
+                    // Save l_old before rescaling, apply baseline shift correction:
+                    // e_new = alpha * e_old + (m_old - m_new) * alpha * l_old
+                    float row_sum_old = row_sum(mi);
+                    row_acc(mi) = row_acc(mi) * scores_scale
+                                 + (scores_max_prev(mi) - scores_max_cur) * scores_scale * row_sum_old;
+                }
                 row_sum(mi) *= scores_scale;
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(acc_o_rowcol); ++ni) { acc_o_rowcol(mi, ni) *= scores_scale; }
@@ -163,6 +188,20 @@ struct Softmax {
             // We don't do the reduce across threads here since we don't need to use the row_sum.
             // We do that reduce at the end when we need to normalize the softmax.
             FLASH_NAMESPACE::reduce_sum</*zero_init=*/false>(scores, row_sum);
+            if constexpr (Return_entropy) {
+                #pragma unroll
+                for (int mi = 0; mi < size(row_acc); ++mi) {
+                    float acc = 0.f;
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ++ni) {
+                        float raw = scores_raw(mi, ni);
+                        if (raw == -INFINITY || raw == INFINITY) { continue; }
+                        // delta_e = sum((s_i - row_max) * exp(s_i - row_max))
+                        acc += (raw - row_max(mi)) * scores(mi, ni);
+                    }
+                    row_acc(mi) += acc;
+                }
+            }
         }
     };
 
@@ -170,6 +209,7 @@ struct Softmax {
     __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
+        if constexpr (Return_entropy) { quad_allreduce_(row_acc, row_acc, sum_op); }
         TensorT lse = make_fragment_like(row_sum);
         Tensor acc_o_rowcol = make_tensor(acc_o.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_o.layout()));
         static_assert(decltype(size<0>(acc_o_rowcol))::value == kNRows);
