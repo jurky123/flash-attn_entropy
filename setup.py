@@ -392,24 +392,6 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
             ],
         )
     )
-    # Mask generation kernel (standalone, separate from flash_attn_2_cuda)
-    ext_modules.append(
-        CUDAExtension(
-            name="mask_gen_cuda",
-            sources=[
-                "csrc/flash_attn/src/mask_gen.cu",
-            ],
-            extra_compile_args={
-                "cxx": compiler_c17_flag,
-                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag),
-            },
-            include_dirs=[
-                Path(this_dir) / "csrc" / "flash_attn",
-                Path(this_dir) / "csrc" / "flash_attn" / "src",
-                Path(this_dir) / "csrc" / "cutlass" / "include",
-            ],
-        )
-    )
 elif not SKIP_CUDA_BUILD and IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
     TORCH_MAJOR = int(torch.__version__.split(".")[0])
