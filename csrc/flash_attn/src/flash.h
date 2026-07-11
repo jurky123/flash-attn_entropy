@@ -63,8 +63,17 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lse_ptr;
     void * __restrict__ softmax_lseaccum_ptr;
 
-    // The pointer to the entropy (base-2, fp32).
+    // The pointer to the entropy (natural-log, fp32).
     void * __restrict__ entropy_ptr;
+
+    // The pointer to the mask output [b, h, seqlen_q, seqlen_k], bool.
+    void * __restrict__ mask_ptr;
+
+    // Entropy-to-k_ratio lookup table.
+    float *__restrict__ entropy_breakpoints_ptr;  // [num_breakpoints] fp32, strictly increasing
+    float *__restrict__ k_ratio_values_ptr;       // [num_breakpoints] fp32
+    int num_breakpoints;                           // length of the lookup table
+    float cumsum_threshold;                       // for precise mode (future)
 
     // The dimensions.
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim, total_q;

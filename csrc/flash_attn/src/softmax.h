@@ -226,4 +226,33 @@ struct Softmax {
     };
 };
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// Entropy-to-k_ratio lookup and k_keep computation (called in kernel epilogue).
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+__device__ __forceinline__ float lookup_k_ratio(
+    float entropy,
+    const float *__restrict__ breakpoints,  // [num_pts], strictly increasing
+    const float *__restrict__ values,       // [num_pts]
+    int num_pts
+) {
+    // Clamp to breakpoint range
+    if (entropy <= breakpoints[0]) { return values[0]; }
+    if (entropy >= breakpoints[num_pts - 1]) { return values[num_pts - 1]; }
+    // Binary search
+    int lo = 0, hi = num_pts - 1;
+    while (lo + 1 < hi) {
+        int mid = (lo + hi) >> 1;
+        if (breakpoints[mid] <= entropy) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // Linear interpolate between lo and hi
+    float denom = breakpoints[hi] - breakpoints[lo];
+    float frac = denom > 1e-10f ? (entropy - breakpoints[lo]) / denom : 0.f;
+    return values[lo] + frac * (values[hi] - values[lo]);
+}
+
 }  // namespace FLASH_NAMESPACE

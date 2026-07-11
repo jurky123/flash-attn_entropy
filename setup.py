@@ -354,14 +354,16 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_bwd_hdim192_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim256_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_bwd_hdim256_bf16_causal_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim64_bf16_sm80.cu",
+                # Non-causal split-kv: hdim32_fp16, hdim32_bf16, hdim64_fp16, hdim64_bf16, hdim128_fp16, hdim128_bf16
+                # hang nvcc (0% CPU). They are dead code anyway — flash_api.cpp guards split-kv with Is_causal.
+                # "csrc/flash_attn/src/flash_fwd_split_hdim32_fp16_sm80.cu",
+                # "csrc/flash_attn/src/flash_fwd_split_hdim32_bf16_sm80.cu",
+                # "csrc/flash_attn/src/flash_fwd_split_hdim64_fp16_sm80.cu",
+                # "csrc/flash_attn/src/flash_fwd_split_hdim64_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim96_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim96_bf16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_sm80.cu",
-                "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu",
+                # "csrc/flash_attn/src/flash_fwd_split_hdim128_fp16_sm80.cu",
+                # "csrc/flash_attn/src/flash_fwd_split_hdim128_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_sm80.cu",
@@ -378,6 +380,24 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
+            ],
+            extra_compile_args={
+                "cxx": compiler_c17_flag,
+                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag),
+            },
+            include_dirs=[
+                Path(this_dir) / "csrc" / "flash_attn",
+                Path(this_dir) / "csrc" / "flash_attn" / "src",
+                Path(this_dir) / "csrc" / "cutlass" / "include",
+            ],
+        )
+    )
+    # Mask generation kernel (standalone, separate from flash_attn_2_cuda)
+    ext_modules.append(
+        CUDAExtension(
+            name="mask_gen_cuda",
+            sources=[
+                "csrc/flash_attn/src/mask_gen.cu",
             ],
             extra_compile_args={
                 "cxx": compiler_c17_flag,

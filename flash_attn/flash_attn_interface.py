@@ -1287,6 +1287,509 @@ def flash_attn_func_with_entropy(
     return out, entropy_tensor
 
 
+def _entropy_to_k_ratio(entropy: torch.Tensor, table: torch.Tensor) -> torch.Tensor:
+    """Piecewise-linear map from per-token entropy to k_ratio.
+
+    Args:
+        entropy: [B, H, Sq] fp32, per-token entropy in nats.
+        table: [2, P] fp32. row0 = entropy breakpoints (strictly increasing),
+               row1 = corresponding k_ratio values in (0, 1].
+
+    Returns:
+        k_ratio: [B, H, Sq] fp32, same device as entropy.
+    """
+    breakpoints = table[0]  # [P]
+    values = table[1]       # [P]
+    device = entropy.device
+    P = breakpoints.shape[0]
+
+    # Binary-search each entropy into the right bucket
+    idx_right = torch.searchsorted(breakpoints, entropy)  # [B, H, Sq]
+    idx_left = (idx_right - 1).clamp(min=0)
+    idx_right = idx_right.clamp(max=P - 1)
+
+    e_left = breakpoints[idx_left]   # [B, H, Sq]
+    e_right = breakpoints[idx_right]
+    v_left = values[idx_left]
+    v_right = values[idx_right]
+
+    # Linear interpolation, handle degenerate segments
+    denom = e_right - e_left
+    frac = torch.where(denom > 1e-10, (entropy - e_left) / denom, torch.zeros_like(entropy))
+    frac = frac.clamp(0.0, 1.0)
+    k_ratio = v_left + frac * (v_right - v_left)
+    return k_ratio
+
+
+def _precise_mask(
+    q: torch.Tensor,        # [B, Sq, H, D]
+    k: torch.Tensor,        # [B, Sk, H, D]
+    k_ratio: torch.Tensor,  # [B, H, Sq] fp32
+    scale: float,
+    causal: bool,
+    cumsum_threshold: float,
+    chunk_size: int = 256,  # query chunk size to bound memory
+) -> torch.Tensor:
+    """Generate mask by top-p (cumulative probability) per query row, with k_ratio hard cap.
+
+    For each query row, keeps keys satisfying BOTH:
+      - cumulative probability < cumsum_threshold (top-p)
+      - count ≤ ceil(k_ratio * Sk) (hard cap)
+
+    Processes queries in chunks to avoid materializing the full [B,H,Sq,Sk]
+    score/prob tensor.
+
+    Returns:
+        mask: [B, H, Sq, Sk] bool.
+    """
+    B, Sq, H, D = q.shape
+    Sk = k.shape[1]
+    device = q.device
+
+    q_ = q.float().permute(0, 2, 1, 3)                   # [B, H, Sq, D]
+    k_ = k.float().permute(0, 2, 1, 3)                   # [B, H, Sk, D]
+    k_t = k_.transpose(-2, -1)                            # [B, H, D, Sk]
+
+    k_cap = (k_ratio * Sk).ceil().long().clamp(min=1, max=Sk)  # [B, H, Sq]
+
+    mask = torch.empty(B, H, Sq, Sk, dtype=torch.bool, device=device)
+
+    for q_start in range(0, Sq, chunk_size):
+        q_end = min(q_start + chunk_size, Sq)
+        chunk_len = q_end - q_start
+
+        q_chunk = q_[:, :, q_start:q_end]                # [B, H, chunk, D]
+        scores_chunk = torch.matmul(q_chunk, k_t) * scale  # [B, H, chunk, Sk]
+
+        if causal:
+            row_idx = torch.arange(q_start, q_end, device=device).view(-1, 1)  # [chunk, 1]
+            col_idx = torch.arange(Sk, device=device).view(1, -1)              # [1, Sk]
+            scores_chunk.masked_fill_(col_idx > row_idx, float('-inf'))
+
+        probs_chunk = torch.softmax(scores_chunk, dim=-1)  # [B, H, chunk, Sk]
+
+        # Sort probs descending, cumsum, find cut point per row
+        sorted_probs, sorted_idx = torch.sort(probs_chunk, dim=-1, descending=True)
+        cumsum = torch.cumsum(sorted_probs, dim=-1)
+        k_cut = (cumsum < cumsum_threshold).sum(dim=-1).clamp(min=1)  # [B, H, chunk]
+
+        k_cap_chunk = k_cap[:, :, q_start:q_end]           # [B, H, chunk]
+        k_final = torch.minimum(k_cut, k_cap_chunk)         # [B, H, chunk]
+        k_max = k_final.max().item()
+
+        _, topk_idx = torch.topk(probs_chunk, k=min(k_max, Sk), dim=-1)  # [B, H, chunk, k_max]
+
+        pos = torch.arange(k_max, device=device).view(1, 1, 1, -1)
+        keep = pos < k_final.unsqueeze(-1)
+
+        mask_chunk = torch.zeros(B, H, chunk_len, Sk, dtype=torch.bool, device=device)
+        mask_chunk.scatter_(-1, topk_idx, keep.to(mask_chunk.dtype))
+        mask[:, :, q_start:q_end] = mask_chunk
+
+    return mask
+
+
+# ---- Optional: mask generation CUDA kernel ----
+try:
+    import mask_gen_cuda
+    _HAS_MASK_GEN_KERNEL = True
+except ImportError:
+    _HAS_MASK_GEN_KERNEL = False
+
+
+def _mask_gen_cuda(
+    q: torch.Tensor,        # [B, Sq, H, D], fp16/bf16
+    k: torch.Tensor,        # [B, Sk, H, D], fp16/bf16
+    k_param: torch.Tensor,  # [B, H, Sq] fp32 (k_keep for quantile, k_ratio for precise)
+    softmax_scale: float,
+    precise: bool,
+    cumsum_threshold: float = 0.9,
+) -> torch.Tensor:
+    """CUDA kernel for mask generation (2-pass histogram, tiled, no full [Sq,Sk] matrix).
+
+    Returns:
+        mask: [B, H, Sq, Sk] bool.
+    """
+    if not _HAS_MASK_GEN_KERNEL:
+        raise RuntimeError("mask_gen_cuda kernel not available; reinstall with setup.py")
+
+    if q.dtype == torch.float16:
+        fn = mask_gen_cuda.mask_gen_precise if precise else mask_gen_cuda.mask_gen_quantile
+    elif q.dtype == torch.bfloat16:
+        fn = mask_gen_cuda.mask_gen_precise_bf16 if precise else mask_gen_cuda.mask_gen_quantile_bf16
+    else:
+        raise ValueError(f"Unsupported dtype: {q.dtype}")
+
+    # The kernel expects B=1, Sq, H, D (4D). Ensure input is contiguous.
+    q_4d = q.contiguous() if q.dim() == 4 else q
+    k_4d = k.contiguous() if k.dim() == 4 else k
+    k_param_3d = k_param.contiguous() if k_param.dim() == 3 else k_param
+
+    return fn(q_4d, k_4d, k_param_3d, softmax_scale, cumsum_threshold)
+
+
+def _quantile_mask(
+    q: torch.Tensor,        # [B, Sq, H, D]
+    k: torch.Tensor,        # [B, Sk, H, D]
+    k_ratio: torch.Tensor,  # [B, H, Sq] fp32, per-token retention ratio
+    scale: float,
+    causal: bool,
+    chunk_size: int = 512,  # query chunk size to bound memory
+) -> torch.Tensor:
+    """Generate mask by score quantile per query row.
+
+    Processes queries in chunks to avoid materializing the full [B,H,Sq,Sk]
+    score tensor. Peak memory = O(B * H * chunk_size * Sk) instead of O(B * H * Sq * Sk).
+
+    Returns:
+        mask: [B, H, Sq, Sk] bool.
+    """
+    B, Sq, H, D = q.shape
+    Sk = k.shape[1]
+    device = q.device
+
+    q_ = q.float().permute(0, 2, 1, 3)                   # [B, H, Sq, D]
+    k_ = k.float().permute(0, 2, 1, 3)                   # [B, H, Sk, D]
+    k_t = k_.transpose(-2, -1)                            # [B, H, D, Sk]
+    k_keep = (k_ratio * Sk).ceil().long().clamp(min=1, max=Sk).unsqueeze(-1)  # [B, H, Sq, 1]
+
+    mask = torch.empty(B, H, Sq, Sk, dtype=torch.bool, device=device)
+
+    for q_start in range(0, Sq, chunk_size):
+        q_end = min(q_start + chunk_size, Sq)
+        q_chunk = q_[:, :, q_start:q_end]                # [B, H, chunk, D]
+        scores_chunk = torch.matmul(q_chunk, k_t) * scale  # [B, H, chunk, Sk]
+
+        if causal:
+            row_idx = torch.arange(q_start, q_end, device=device).view(-1, 1)  # [chunk, 1]
+            col_idx = torch.arange(Sk, device=device).view(1, -1)              # [1, Sk]
+            scores_chunk.masked_fill_(col_idx > row_idx, float('-inf'))
+
+        kk = k_keep[:, :, q_start:q_end]                  # [B, H, chunk, 1]
+        k_max = kk.max().item()
+        topk_vals = torch.topk(scores_chunk, k=min(k_max, Sk), dim=-1, sorted=True).values  # [B, H, chunk, k_max]
+        thresholds = torch.gather(topk_vals, -1, (kk - 1).clamp(min=0))  # [B, H, chunk, 1]
+        mask[:, :, q_start:q_end] = (scores_chunk >= thresholds)
+
+    return mask
+
+
+def flash_attn_with_entropy_mask(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    entropy_to_k_ratio: torch.Tensor,
+    precise: bool = False,
+    cumsum_threshold: float = 0.9,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    softmax_scale: Optional[float] = None,
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    mask_chunk_size: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FlashAttention forward + per-token entropy + entropy-guided mask.
+
+    Block A: flash_attn_func_with_entropy → (out, entropy), no extra cost vs FA2.
+    Block B: entropy → k_ratio via piecewise-linear lookup (torch.searchsorted).
+    Block C: mask generation:
+      - precise=False: score-quantile mask (topk threshold, no softmax).
+      - precise=True: top-p cumsum mask with k_ratio as hard cap.
+
+    Mask generation processes queries in chunks of mask_chunk_size to bound
+    peak memory at O(B * H * mask_chunk_size * Sk) instead of O(B * H * Sq * Sk).
+
+    Args:
+        q: [B, Sq, H, D], fp16/bf16.
+        k: [B, Sk, H, D], fp16/bf16.
+        v: [B, Sk, H, D], fp16/bf16.
+        entropy_to_k_ratio: [2, P] fp32. row0 = entropy breakpoints (strictly
+            increasing), row1 = corresponding k_ratio in (0, 1].
+        precise: if True, use top-p cumsum mask with k_ratio hard cap.
+                 if False, use score-quantile mask (faster, no softmax).
+        cumsum_threshold: only used when precise=True, cumulative probability
+            threshold for top-p truncation (default 0.9).
+        causal: apply causal mask.
+        window_size: (left, right) sliding-window attention.
+        softmax_scale: default 1/sqrt(D).
+        softcap: softcapping value (0 = disabled).
+        alibi_slopes: ALiBi slopes.
+        mask_chunk_size: query chunk size for mask generation (default 512).
+            Smaller values use less memory but more kernel launches.
+
+    Returns:
+        out:     [B, Sq, H, D]  attention output.
+        entropy: [B, H, Sq]     per-token entropy in nats (fp32).
+        mask:    [B, H, Sq, Sk] bool.
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    # Block A: flash attention + entropy (already fused in the CUDA kernel)
+    out, entropy = flash_attn_func_with_entropy(
+        q, k, v,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+    )
+
+    # Block B: entropy → k_ratio lookup
+    k_ratio = _entropy_to_k_ratio(entropy, entropy_to_k_ratio)
+
+    # Block C: mask generation (CUDA kernel if available, else chunked Python)
+    if precise:
+        k_param = k_ratio  # [B, H, Sq] fp32
+    else:
+        k_param = (k_ratio * k.shape[1]).ceil().clamp(min=1, max=k.shape[1])  # [B, H, Sq] k_keep
+
+    if _HAS_MASK_GEN_KERNEL and not causal:
+        # CUDA kernel: 2/3-pass histogram, tiled, no [Sq,Sk] materialization
+        mask = _mask_gen_cuda(
+            q, k, k_param.float(),
+            softmax_scale, precise, cumsum_threshold,
+        )
+    else:
+        # Python fallback: chunked along Sq, uses PyTorch CUDA ops
+        mask_fn = _precise_mask if precise else _quantile_mask
+        mask = mask_fn(q, k, k_ratio, softmax_scale, causal, cumsum_threshold,
+                       chunk_size=mask_chunk_size)
+
+    return out, entropy, mask
+
+
+def _shrink_block_counts(
+    block_counts: torch.Tensor,
+    block_size: int,
+    density_threshold: float = 1.0 / 3.0,
+    frac_threshold: float = 0.6,
+) -> torch.Tensor:
+    """Convert per-key-token query-row hit counts to block mask.
+
+    Matches shrinkMaskStrict semantics exactly.
+
+    Args:
+        block_counts: [B, H, num_qb, num_kb, block_size] int32.
+            block_counts[b,h,qb,kb,kt] = number of query rows in q-block qb
+            that attend to key token (kb*block_size + kt).
+        block_size: the block size used for blockification.
+        density_threshold: a key token is "high density" if the fraction
+            of query rows attending to it > this value (default 1/3).
+        frac_threshold: a block is active if the fraction of high-density
+            key tokens > this value among non-zero tokens (default 0.6).
+
+    Returns:
+        block_mask: [B, H, num_qb, num_kb] bool.
+    """
+    col_density = block_counts.float() / block_size
+    high = col_density > density_threshold
+    non_zero = col_density > 0
+    high_sum = high.sum(dim=-1)
+    non_zero_sum = non_zero.sum(dim=-1)
+    frac_high = high_sum / (non_zero_sum + 1e-9)
+    block_mask = frac_high > frac_threshold
+
+    num_qb = block_mask.shape[2]
+    num_kb = block_mask.shape[3]
+    diag_len = min(num_qb, num_kb)
+    if diag_len > 0:
+        diag_idx = torch.arange(diag_len, device=block_mask.device)
+        block_mask[:, :, diag_idx, diag_idx] = True
+
+    return block_mask
+
+
+def _block_mask_gen_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    k_param: torch.Tensor,
+    softmax_scale: float,
+    precise: bool,
+    cumsum_threshold: float,
+    block_size: int,
+) -> torch.Tensor:
+    """CUDA kernel for block-level mask generation.
+
+    Returns:
+        block_counts: [B, H, num_qb, block_size, num_kb] int32.
+    """
+    if not _HAS_MASK_GEN_KERNEL:
+        raise RuntimeError("mask_gen_cuda kernel not available; reinstall with setup.py")
+
+    if q.dtype == torch.float16:
+        fn = mask_gen_cuda.block_mask_gen_precise if precise else mask_gen_cuda.block_mask_gen_quantile
+    elif q.dtype == torch.bfloat16:
+        fn = mask_gen_cuda.block_mask_gen_precise_bf16 if precise else mask_gen_cuda.block_mask_gen_quantile_bf16
+    else:
+        raise ValueError(f"Unsupported dtype: {q.dtype}")
+
+    q_4d = q.contiguous() if q.dim() == 4 else q
+    k_4d = k.contiguous() if k.dim() == 4 else k
+    k_param_3d = k_param.contiguous() if k_param.dim() == 3 else k_param
+
+    return fn(q_4d, k_4d, k_param_3d, softmax_scale, cumsum_threshold, block_size)
+
+
+def _quantile_block_mask(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    k_ratio: torch.Tensor,
+    scale: float,
+    causal: bool,
+    block_size: int,
+    chunk_size: int = 512,
+) -> torch.Tensor:
+    """Python fallback: chunked quantile mask → block counts.
+
+    Processes queries in chunks, computes token-level topk mask per chunk,
+    then accumulates per-key-token hit counts matching shrinkMaskStrict
+    semantics. Never materializes the full [B, H, Sq, Sk] token mask.
+
+    Returns:
+        block_counts: [B, H, num_qb, num_kb, block_size] int32.
+            block_counts[b,h,qb,kb,kt] = number of query rows in q-block qb
+            that attend to key token (kb*block_size + kt).
+    """
+    B, Sq, H, D = q.shape
+    Sk = k.shape[1]
+    device = q.device
+
+    num_qb = (Sq + block_size - 1) // block_size
+    num_kb = (Sk + block_size - 1) // block_size
+    padded_Sk = num_kb * block_size
+
+    q_ = q.float().permute(0, 2, 1, 3)
+    k_ = k.float().permute(0, 2, 1, 3)
+    k_t = k_.transpose(-2, -1)
+    k_keep = (k_ratio * Sk).ceil().long().clamp(min=1, max=Sk).unsqueeze(-1)
+
+    block_counts = torch.zeros(B, H, num_qb, num_kb, block_size,
+                               dtype=torch.int32, device=device)
+
+    for q_start in range(0, Sq, chunk_size):
+        q_end = min(q_start + chunk_size, Sq)
+        chunk_len = q_end - q_start
+
+        q_chunk = q_[:, :, q_start:q_end]
+        scores_chunk = torch.matmul(q_chunk, k_t) * scale
+
+        if causal:
+            row_idx = torch.arange(q_start, q_end, device=device).view(-1, 1)
+            col_idx = torch.arange(Sk, device=device).view(1, -1)
+            scores_chunk.masked_fill_(col_idx > row_idx, float('-inf'))
+
+        kk = k_keep[:, :, q_start:q_end]
+        kk_max = kk.max().item()
+        topk_vals = torch.topk(scores_chunk, k=min(kk_max, Sk),
+                               dim=-1, sorted=True).values
+        thresholds = torch.gather(topk_vals, -1, (kk - 1).clamp(min=0))
+        mask_chunk = (scores_chunk >= thresholds)
+
+        if padded_Sk > Sk:
+            mask_padded = torch.zeros(B, H, chunk_len, padded_Sk,
+                                      dtype=torch.bool, device=device)
+            mask_padded[:, :, :, :Sk] = mask_chunk
+            mask_chunk = mask_padded
+
+        mask_blocks = mask_chunk.view(B, H, chunk_len, num_kb, block_size)
+
+        for i in range(chunk_len):
+            abs_qr = q_start + i
+            macro_qb = abs_qr // block_size
+            block_counts[:, :, macro_qb] += mask_blocks[:, :, i].int()
+
+    return block_counts
+
+
+def flash_attn_with_block_mask(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    entropy_to_k_ratio: torch.Tensor,
+    block_size: int = 64,
+    density_threshold: float = 1.0 / 3.0,
+    frac_threshold: float = 0.6,
+    causal: bool = False,
+    window_size: Tuple[int, int] = (-1, -1),
+    softmax_scale: Optional[float] = None,
+    softcap: float = 0.0,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    mask_chunk_size: int = 512,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """FlashAttention forward + entropy + blockified sparse mask.
+
+    Combines flash_attn_func_with_entropy (Block A), entropy-to-k_ratio
+    lookup (Block B), and block-level mask generation (Block C) into a
+    single call. The mask is returned at block granularity — no full
+    [B, H, Sq, Sk] tensor is ever materialized.
+
+    Args:
+        q: [B, Sq, H, D], fp16/bf16.
+        k: [B, Sk, H, D], fp16/bf16.
+        v: [B, Sk, H, D], fp16/bf16.
+        entropy_to_k_ratio: [2, P] fp32. row0 = entropy breakpoints
+            (strictly increasing), row1 = corresponding k_ratio in (0, 1].
+        block_size: block size for mask blockification (default 64).
+        density_threshold: col_density > this → "high density" (default 1/3).
+        frac_threshold: fraction of high-density rows > this → block active
+            (default 0.6).
+        causal: apply causal mask.
+        window_size: (left, right) sliding-window attention.
+        softmax_scale: default 1/sqrt(D).
+        softcap: softcapping value (0 = disabled).
+        alibi_slopes: ALiBi slopes.
+        mask_chunk_size: query chunk size for Python fallback (default 512).
+
+    Returns:
+        out:        [B, Sq, H, D]  attention output.
+        entropy:    [B, H, Sq]     per-token entropy (fp32).
+        block_mask: [B, H, num_qb, num_kb] bool, where
+                    num_qb = ceil(Sq / block_size),
+                    num_kb = ceil(Sk / block_size).
+    """
+    if softmax_scale is None:
+        softmax_scale = q.shape[-1] ** (-0.5)
+
+    # Block A: flash attention + entropy
+    out, entropy = flash_attn_func_with_entropy(
+        q, k, v,
+        dropout_p=0.0,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        alibi_slopes=alibi_slopes,
+    )
+
+    # Block B: entropy → k_ratio
+    k_ratio = _entropy_to_k_ratio(entropy, entropy_to_k_ratio)
+
+    # Block C: block mask generation
+    k_param = (k_ratio * k.shape[1]).ceil().clamp(min=1, max=k.shape[1])
+
+    if _HAS_MASK_GEN_KERNEL and not causal:
+        block_counts = _block_mask_gen_cuda(
+            q, k, k_param.float(), softmax_scale,
+            precise=False, cumsum_threshold=0.9,
+            block_size=block_size,
+        )
+    else:
+        block_counts = _quantile_block_mask(
+            q, k, k_ratio, softmax_scale, causal,
+            block_size=block_size, chunk_size=mask_chunk_size,
+        )
+
+    block_mask = _shrink_block_counts(
+        block_counts, block_size,
+        density_threshold=density_threshold,
+        frac_threshold=frac_threshold,
+    )
+
+    return out, entropy, block_mask
+
+
 def flash_attn_varlen_qkvpacked_func(
     qkv,
     cu_seqlens,
